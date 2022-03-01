@@ -3,8 +3,8 @@ name: Build and Push
 on:
   push:
     branches:
-     - main
-     - main-thesis
+      - main
+      - main-thesis
     tags:
       - v*
 
@@ -31,15 +31,15 @@ jobs:
 
           # Strip git ref prefix from version
           VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-          
+
           DOCKER_IMAGE=${{ secrets.DOCKER_USER }}/${GITHUB_REPOSITORY#*/}
-          
+
           # Use Docker `latest` tag convention     
           [ "$VERSION" == "main-thesis" ] && VERSION=latest
           echo $VERSION
-          
+
           TAGS="${DOCKER_IMAGE}:${VERSION}"
-          
+
           # Set output parameters.
           echo ::set-output name=tags::${TAGS}
           echo ::set-output name=git_commit::${GIT_COMMIT}

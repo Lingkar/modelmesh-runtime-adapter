@@ -122,9 +122,16 @@ RUN microdnf install \
     gcc-c++ \
     python38 && \
     ln -sf /usr/bin/python3 /usr/bin/python && \
-    ln -sf /usr/bin/pip3 /usr/bin/pip && \
-    pip install tensorflow
+    ln -sf /usr/bin/pip3 /usr/bin/pip
 
+# Install tensorflow based on architecture
+RUN if [ "$TARGETARCH" = "amd64" ] ; then \
+      pip install tensorflow; \
+   elif [ "$TARGETARCH" = "arm64" ] ; then \
+      pip install tensorflow -f https://tf.kmtea.eu/whl/stable.html; \
+    else \
+    echo No targetarch was set; \
+  fi
 USER ${USER}
 
 # Copy over the binary and use it as the entrypoint

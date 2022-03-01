@@ -109,6 +109,8 @@ ARG IMAGE_VERSION
 ARG COMMIT_SHA
 ARG USER=2000
 
+ARG TARGETARCH
+
 LABEL name="model-serving-runtime-adapter" \
       version="${IMAGE_VERSION}" \
       release="${COMMIT_SHA}" \

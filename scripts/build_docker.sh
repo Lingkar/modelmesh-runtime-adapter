@@ -88,6 +88,9 @@ if [[ $DOCKER_TARGET == 'runtime' ]]; then
   docker_args+=("--build-arg=COMMIT_SHA=${git_commit_sha}")
   docker_args+=("--build-arg=IMAGE_VERSION=${DOCKER_TAG}")
 fi
+if [[ $DOCKER_TARGET == 'develop' ]]; then
+  docker_args+=("--build-arg=TARGETARCH=amd64")
+fi
 
 docker build . \
   "${docker_args[@]}"

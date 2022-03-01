@@ -126,6 +126,8 @@ RUN microdnf install \
     ln -sf /usr/bin/python3 /usr/bin/python && \
     ln -sf /usr/bin/pip3 /usr/bin/pip
 
+RUN pip install --upgrade pip
+
 # Install tensorflow based on architecture
 RUN if [ "$TARGETARCH" = "amd64" ] ; then \
       pip install tensorflow; \

@@ -20,6 +20,8 @@ import (
 	"os"
 	"time"
 
+	"google.golang.org/grpc/credentials/insecure"
+
 	"github.com/go-logr/logr"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
@@ -54,18 +56,18 @@ type TritonAdapterServer struct {
 	Puller        *puller.Puller
 	AdapterConfig *AdapterConfiguration
 	Log           logr.Logger
+
+	// embed generated Unimplemented type for forward-compatibility for gRPC
+	mmesh.UnimplementedModelRuntimeServer
 }
 
 func NewTritonAdapterServer(runtimePort int, config *AdapterConfiguration, log logr.Logger) *TritonAdapterServer {
 	log = log.WithName("Triton Adapter Server")
+
 	log.Info("Connecting to Triton...", "port", runtimePort)
-
-	tritonClientCtx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
-
-	conn, err := grpc.DialContext(tritonClientCtx, fmt.Sprintf("localhost:%d", runtimePort), grpc.WithInsecure(), grpc.WithBlock(),
+	conn, err := grpc.DialContext(context.Background(), fmt.Sprintf("localhost:%d", runtimePort),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithConnectParams(grpc.ConnectParams{Backoff: backoff.DefaultConfig, MinConnectTimeout: 10 * time.Second}))
-
 	if err != nil {
 		log.Error(err, "Can not connect to Triton Runtime")
 		os.Exit(1)
@@ -81,15 +83,7 @@ func NewTritonAdapterServer(runtimePort int, config *AdapterConfiguration, log l
 		s.Puller = puller.NewPuller(log)
 	}
 
-	resp, tritonErr := s.Client.ServerMetadata(tritonClientCtx, &triton.ServerMetadataRequest{})
-	if tritonErr != nil || resp.Version == "" {
-		log.Error(tritonErr, "Warning: Triton failed to get version from server metadata")
-	} else {
-		s.AdapterConfig.RuntimeVersion = resp.Version
-	}
-
-	log.Info("Triton Runtime connected!")
-
+	log.Info("Triton runtime adapter started")
 	return s
 }
 
@@ -100,7 +94,7 @@ func (s *TritonAdapterServer) LoadModel(ctx context.Context, req *mmesh.LoadMode
 
 	if s.AdapterConfig.UseEmbeddedPuller {
 		var pullerErr error
-		req, pullerErr = s.Puller.ProcessLoadModelRequest(req)
+		req, pullerErr = s.Puller.ProcessLoadModelRequest(ctx, req)
 		if pullerErr != nil {
 			log.Error(pullerErr, "Failed to pull model from storage")
 			return nil, pullerErr
@@ -128,7 +122,7 @@ func (s *TritonAdapterServer) LoadModel(ctx context.Context, req *mmesh.LoadMode
 		return nil, status.Errorf(status.Code(tritonErr), "Failed to load Model due to Triton runtime error: %s", tritonErr)
 	}
 
-	size := calcMemCapacity(req.ModelKey, s.AdapterConfig, log)
+	size := util.CalcMemCapacity(req.ModelKey, s.AdapterConfig.DefaultModelSizeInBytes, s.AdapterConfig.ModelSizeMultiplier, log)
 
 	log.Info("Triton model loaded")
 
@@ -163,30 +157,6 @@ func getModelType(req *mmesh.LoadModelRequest, log logr.Logger) string {
 	return modelType
 }
 
-func calcMemCapacity(reqModelKey string, adapterConfig *AdapterConfiguration, log logr.Logger) uint64 {
-	// Try to calculate the model size from the disk size passed in the LoadModelRequest.ModelKey
-	// but first set the default to fall back on if we cannot get the disk size.
-	size := uint64(adapterConfig.DefaultModelSizeInBytes)
-	var modelKey map[string]interface{}
-	err := json.Unmarshal([]byte(reqModelKey), &modelKey)
-	if err != nil {
-		log.Info("'SizeInBytes' will be defaulted as LoadModelRequest.ModelKey value is not valid JSON", "SizeInBytes", size, "model_key", reqModelKey, "error", err)
-	} else {
-		if modelKey[diskSizeBytesJSONKey] != nil {
-			diskSize, ok := modelKey[diskSizeBytesJSONKey].(float64)
-			if ok {
-				size = uint64(diskSize * adapterConfig.ModelSizeMultiplier)
-				log.Info("Setting 'SizeInBytes' to a multiple of model disk size", "SizeInBytes", size, "disk_size", diskSize, "multiplier", adapterConfig.ModelSizeMultiplier)
-			} else {
-				log.Info("'SizeInBytes' will be defaulted as LoadModelRequest.ModelKey 'disk_size_bytes' value is not a number", "SizeInBytes", size, "model_key", modelKey)
-			}
-		} else {
-			log.Info("'SizeInBytes' will be defaulted as LoadModelRequest.ModelKey did not contain a value for 'disk_size_bytes'", "SizeInBytes", size, "model_key", modelKey)
-		}
-	}
-	return size
-}
-
 func (s *TritonAdapterServer) UnloadModel(ctx context.Context, req *mmesh.UnloadModelRequest) (*mmesh.UnloadModelResponse, error) {
 	_, tritonErr := s.Client.RepositoryModelUnload(ctx, &triton.RepositoryModelUnloadRequest{
 		ModelName: req.ModelId,
@@ -206,9 +176,9 @@ func (s *TritonAdapterServer) UnloadModel(ctx context.Context, req *mmesh.Unload
 		}
 	}
 
-	tritonModelIDDir, err := util.SecureJoin(s.AdapterConfig.RootModelDir, tritonModelSubdir, req.ModelId)
+	tritonModelIDDir, err := util.SecureJoin(s.AdapterConfig.RootModelDir, req.ModelId)
 	if err != nil {
-		s.Log.Error(err, "Unable to securely join", "rootModelDir", s.AdapterConfig.RootModelDir, "tritonModelSubdir", tritonModelSubdir, "modelId", req.ModelId)
+		s.Log.Error(err, "Unable to securely join", "rootModelDir", s.AdapterConfig.RootModelDir, "modelId", req.ModelId)
 		return nil, err
 	}
 	err = os.RemoveAll(tritonModelIDDir)
@@ -227,33 +197,19 @@ func (s *TritonAdapterServer) UnloadModel(ctx context.Context, req *mmesh.Unload
 	return &mmesh.UnloadModelResponse{}, nil
 }
 
-//TODO: this implementation need to be reworked
-func (s *TritonAdapterServer) PredictModelSize(ctx context.Context, req *mmesh.PredictModelSizeRequest) (*mmesh.PredictModelSizeResponse, error) {
-	size := s.AdapterConfig.DefaultModelSizeInBytes
-	return &mmesh.PredictModelSizeResponse{SizeInBytes: uint64(size)}, nil
-}
-
-func (s *TritonAdapterServer) ModelSize(ctx context.Context, req *mmesh.ModelSizeRequest) (*mmesh.ModelSizeResponse, error) {
-	size := s.AdapterConfig.DefaultModelSizeInBytes // TODO find out size
-
-	return &mmesh.ModelSizeResponse{SizeInBytes: uint64(size)}, nil
-}
-
 func (s *TritonAdapterServer) RuntimeStatus(ctx context.Context, req *mmesh.RuntimeStatusRequest) (*mmesh.RuntimeStatusResponse, error) {
 	log := s.Log
-	runtimeStatus := new(mmesh.RuntimeStatusResponse)
+	runtimeStatus := &mmesh.RuntimeStatusResponse{Status: mmesh.RuntimeStatusResponse_STARTING}
 
 	serverReadyResponse, tritonErr := s.Client.ServerReady(ctx, &triton.ServerReadyRequest{})
 
 	if tritonErr != nil {
 		log.Info("Triton failed to get status or not ready", "error", tritonErr)
-		runtimeStatus.Status = mmesh.RuntimeStatusResponse_STARTING
 		return runtimeStatus, nil
 	}
 
 	if !serverReadyResponse.Ready {
 		log.Info("Triton runtime not ready")
-		runtimeStatus.Status = mmesh.RuntimeStatusResponse_STARTING
 		return runtimeStatus, nil
 	}
 
@@ -263,21 +219,39 @@ func (s *TritonAdapterServer) RuntimeStatus(ctx context.Context, req *mmesh.Runt
 		Ready:          true})
 
 	if tritonErr != nil {
-		runtimeStatus.Status = mmesh.RuntimeStatusResponse_STARTING
 		log.Info("Triton runtime status, getting model info failed", "error", tritonErr)
 		return runtimeStatus, nil
 	}
 
 	for model := range indexResponse.Models {
-		_, tritonErr := s.Client.RepositoryModelUnload(ctx, &triton.RepositoryModelUnloadRequest{
+		if _, tritonErr := s.Client.RepositoryModelUnload(ctx, &triton.RepositoryModelUnloadRequest{
 			ModelName: indexResponse.Models[model].Name,
-		})
-
-		if tritonErr != nil {
-			runtimeStatus.Status = mmesh.RuntimeStatusResponse_STARTING
+		}); tritonErr != nil {
 			s.Log.Info("Triton runtime status, unload model failed", "error", tritonErr)
 			return runtimeStatus, nil
 		}
+	}
+
+	// Clear adapted model dirs
+	if err := util.ClearDirectoryContents(s.AdapterConfig.RootModelDir, nil); err != nil {
+		log.Error(err, "Error cleaning up local model dir")
+		return &mmesh.RuntimeStatusResponse{Status: mmesh.RuntimeStatusResponse_FAILING}, nil
+	}
+
+	if s.AdapterConfig.UseEmbeddedPuller {
+		if err := s.Puller.ClearLocalModelStorage(tritonModelSubdir); err != nil {
+			log.Error(err, "Error cleaning up local model dir")
+			return &mmesh.RuntimeStatusResponse{Status: mmesh.RuntimeStatusResponse_FAILING}, nil
+		}
+	}
+
+	resp, err := s.Client.ServerMetadata(ctx, &triton.ServerMetadataRequest{})
+	if err != nil {
+		log.Info("Warning: Triton failed to get version from server metadata", "error", err)
+	}
+	if resp.Version != "" {
+		log.Info("Using runtime version returned by Triton", "version", resp.Version)
+		s.AdapterConfig.RuntimeVersion = resp.Version
 	}
 
 	runtimeStatus.Status = mmesh.RuntimeStatusResponse_READY
@@ -291,9 +265,8 @@ func (s *TritonAdapterServer) RuntimeStatus(ctx context.Context, req *mmesh.Runt
 	path1 := []uint32{1}
 
 	mis := make(map[string]*mmesh.RuntimeStatusResponse_MethodInfo)
-
-	// only support Transform for now
 	mis[tritonServiceName+"/ModelInfer"] = &mmesh.RuntimeStatusResponse_MethodInfo{IdInjectionPath: path1}
+	mis[tritonServiceName+"/ModelMetadata"] = &mmesh.RuntimeStatusResponse_MethodInfo{IdInjectionPath: path1}
 	runtimeStatus.MethodInfos = mis
 
 	log.Info("runtimeStatus", "Status", runtimeStatus)

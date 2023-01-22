@@ -15,13 +15,14 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"os"
-	"regexp"
-	"strings"
 	"time"
+
+	"github.com/kserve/modelmesh-runtime-adapter/internal/util"
+
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/go-logr/logr"
 
@@ -43,6 +44,9 @@ type PullerServer struct {
 	pullerServerConfig *PullerServerConfiguration
 	puller             *puller.Puller
 	sm                 *modelStateManager
+
+	// embed generated Unimplemented type for forward-compatibility for gRPC
+	mmesh.UnimplementedModelRuntimeServer
 }
 
 // NewPullerServer creates a new PullerServer instance and initializes it with configuration from the environment
@@ -70,19 +74,14 @@ func (s *PullerServer) StartServer() error {
 	log.Info("Connecting to model runtime", "endpoint", s.pullerServerConfig.ModelServerEndpoint)
 	runtimeClientCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	modelServerEndpoint := s.pullerServerConfig.ModelServerEndpoint
-	match, _ := regexp.MatchString("^port:[0-9]+$", modelServerEndpoint)
-	if match || strings.HasPrefix(modelServerEndpoint, "unix:") {
-		if match {
-			modelServerEndpoint = strings.Replace(modelServerEndpoint, "port", "localhost", 1)
-		}
-	} else {
-		return errors.New("Invaid Endpoint: " + modelServerEndpoint)
+	modelServerEndpoint, err := util.ResolveLocalGrpcEndpoint(s.pullerServerConfig.ModelServerEndpoint)
+	if err != nil {
+		return err
 	}
 	modelRuntimeConnection, err := grpc.DialContext(
 		runtimeClientCtx,
 		modelServerEndpoint,
-		grpc.WithInsecure(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
 		grpc.WithConnectParams(grpc.ConnectParams{
 			Backoff:           backoff.DefaultConfig,
@@ -124,7 +123,7 @@ func (s *PullerServer) loadModel(ctx context.Context, req *mmesh.LoadModelReques
 
 	// Pull the model from storage
 	var pullerErr error
-	req, pullerErr = s.puller.ProcessLoadModelRequest(req)
+	req, pullerErr = s.puller.ProcessLoadModelRequest(ctx, req)
 	if pullerErr != nil {
 		log.Error(pullerErr, "Failed to pull model from storage")
 		return nil, pullerErr
@@ -176,36 +175,15 @@ func (s *PullerServer) unloadModel(ctx context.Context, req *mmesh.UnloadModelRe
 
 // PredictModelSize predicts the size of not-yet-loaded model - must return almost immediately.
 // See model-runtime.proto predictModelSize()
+// This is a Direct passthrough to the model runtime grpc
 func (s *PullerServer) PredictModelSize(ctx context.Context, req *mmesh.PredictModelSizeRequest) (*mmesh.PredictModelSizeResponse, error) {
 	s.Log.Info("Predicting model size", "model_id", req.ModelId, "model_path", req.ModelPath, "model_key", req.ModelKey, "model_type", req.ModelType)
-	// if strings.HasPrefix(req.ModelPath, "cos:") || strings.HasPrefix(req.ModelPath, "s3:") {
-	// 	objSize, err := s.GetObjSizeInCOS(req.ModelPath)
-	// 	if err != nil {
-	// 		return nil, status.Errorf(codes.Internal, "Failed to get obj size from COS: %v", err)
-	// 	}
-	// 	return &mmesh.PredictModelSizeResponse{SizeInBytes: objSize}, nil
-	// }
-
-	// if !strings.HasPrefix(req.ModelPath, "file:") {
-	// 	return nil, status.Error(codes.InvalidArgument, "cannot recognize model path")
-	// }
-
-	// p := req.ModelPath[5:len(req.ModelPath)]
-
-	// size, err := dirSize(p) // Adapter should mount model volume to same path
-	// if err != nil {
-	// 	return nil, status.Error(codes.InvalidArgument, "Cannot calculate size of path: "+p)
-	// }
-
-	// return &mmesh.PredictModelSizeResponse{SizeInBytes: uint64(size)}, nil
-
-	// Direct passthrough to model runtime grpc
 	return s.modelRuntimeClient.PredictModelSize(ctx, req)
 }
 
 // ModelSize calculates the size (memory consumption) of a currently-loaded model.
-// This is a Direct passthrough to the model runtime grpc
 // See model-runtime.proto modelSize()
+// This is a Direct passthrough to the model runtime grpc
 func (s *PullerServer) ModelSize(ctx context.Context, req *mmesh.ModelSizeRequest) (*mmesh.ModelSizeResponse, error) {
 	s.Log.Info("Getting model size", "model_id", req.ModelId)
 	return s.modelRuntimeClient.ModelSize(ctx, req)
@@ -213,9 +191,14 @@ func (s *PullerServer) ModelSize(ctx context.Context, req *mmesh.ModelSizeReques
 
 // RuntimeStatus provides basic runtime status and parameters; called only during startup.
 // This is a Direct passthrough to the model runtime grpc
-// See model-runtime.proto runetimeStatus()
+// See model-runtime.proto runtimeStatus()
 func (s *PullerServer) RuntimeStatus(ctx context.Context, req *mmesh.RuntimeStatusRequest) (*mmesh.RuntimeStatusResponse, error) {
 	s.Log.Info("Getting runtime status")
+
+	rsr, err := s.modelRuntimeClient.RuntimeStatus(ctx, req)
+	if err != nil || rsr.Status != mmesh.RuntimeStatusResponse_READY {
+		return rsr, err
+	}
 
 	s.Log.Info("Unloading all prior loaded models to return to zero state")
 	if err := s.sm.unloadAll(); err != nil {
@@ -224,5 +207,5 @@ func (s *PullerServer) RuntimeStatus(ctx context.Context, req *mmesh.RuntimeStat
 		return &mmesh.RuntimeStatusResponse{Status: mmesh.RuntimeStatusResponse_FAILING}, err
 	}
 
-	return s.modelRuntimeClient.RuntimeStatus(ctx, req)
+	return rsr, nil // READY
 }

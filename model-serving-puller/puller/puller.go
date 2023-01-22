@@ -27,6 +27,7 @@ import (
 	"github.com/kserve/modelmesh-runtime-adapter/internal/proto/mmesh"
 	"github.com/kserve/modelmesh-runtime-adapter/internal/util"
 	"github.com/kserve/modelmesh-runtime-adapter/pullman"
+	_ "github.com/kserve/modelmesh-runtime-adapter/pullman/storageproviders/azure"
 	_ "github.com/kserve/modelmesh-runtime-adapter/pullman/storageproviders/gcs"
 	_ "github.com/kserve/modelmesh-runtime-adapter/pullman/storageproviders/http"
 	_ "github.com/kserve/modelmesh-runtime-adapter/pullman/storageproviders/s3"
@@ -90,7 +91,7 @@ func NewPullerFromConfig(log logr.Logger, config *PullerConfiguration) *Puller {
 // - rewrite ModelPath to a local filesystem path
 // - rewrite ModelKey["schema_path"] to a local filesystem path
 // - add the size of the model on disk to ModelKey["disk_size_bytes"]
-func (s *Puller) ProcessLoadModelRequest(req *mmesh.LoadModelRequest) (*mmesh.LoadModelRequest, error) {
+func (s *Puller) ProcessLoadModelRequest(ctx context.Context, req *mmesh.LoadModelRequest) (*mmesh.LoadModelRequest, error) {
 	var modelKey ModelKeyInfo
 	if parseErr := json.Unmarshal([]byte(req.ModelKey), &modelKey); parseErr != nil {
 		return nil, fmt.Errorf("Invalid modelKey in LoadModelRequest. Error processing JSON '%s': %w", req.ModelKey, parseErr)
@@ -176,7 +177,7 @@ func (s *Puller) ProcessLoadModelRequest(req *mmesh.LoadModelRequest) (*mmesh.Lo
 		Directory:        modelDir,
 		Targets:          targets,
 	}
-	pullerErr := s.PullManager.Pull(context.TODO(), pullCommand)
+	pullerErr := s.PullManager.Pull(ctx, pullCommand)
 	if pullerErr != nil {
 		return nil, status.Errorf(status.Code(pullerErr), "Failed to pull model from storage due to error: %s", pullerErr)
 	}
@@ -247,12 +248,17 @@ func (p *Puller) CleanupModel(modelID string) error {
 		p.Log.Error(err, "Error joining paths", "RootModelDir", p.PullerConfig.RootModelDir, "ModelId", modelID)
 		return err
 	}
-	err = os.RemoveAll(pathToModel)
-	if err != nil {
+	if err = os.RemoveAll(pathToModel); err != nil {
 		p.Log.Error(err, "Model unload failed to delete files from the local filesystem", "local_dir", pathToModel)
 		return fmt.Errorf("Failed to delete model from local filesystem: %w", err)
 	}
 	return nil
+}
+
+func (p *Puller) ClearLocalModelStorage(exclude string) error {
+	return util.ClearDirectoryContents(p.PullerConfig.RootModelDir, func(f os.DirEntry) bool {
+		return f.Name() != exclude
+	})
 }
 
 func (p *Puller) ListModels() ([]string, error) {
